@@ -1,0 +1,22 @@
+{
+  "name": "lhnft",
+  "version": "1.0.0",
+  "description": "NFT Token",
+  "main": "truffle-config.js",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@pinata/sdk": "^1.1.23",
+    "axios": "^0.25.0",
+    "d3": "^7.3.0",
+    "jsdom": "^19.0.0",
+    "pinata": "^0.0.1",
+    "web3": "^1.7.0"
+  }
+}

@@ -1,0 +1,6 @@
+package-lock.json
+/node_modules
+/build
+/scripts/IPFSColors/pinataCredentials.json
+/scripts/IPFSColors/colors
+/scripts/IPFSColors/colorsMetadata
