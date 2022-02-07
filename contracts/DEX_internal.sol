@@ -2,58 +2,74 @@
 pragma solidity ^0.8.0;
 
 import "../interfaces/IERC721.sol";
+import "../interfaces/IERC2981.sol";
 
 contract DEX_internal {
     
-    enum orderType {
+    enum OrderType {
         AUCTION,
-        FIXED
+        FIXED,
+        MIXED
+    }
+
+    enum OrderStatus {
+        ACTIVE,
+        SOLD,
+        CANCELED,
+        OVER
     }
 
     struct Order {
-        orderType orderType;
+        OrderType orderType;
+        OrderStatus status;
         address seller;
-        IERC721 token;
+        IERC721 tokenContract;
         uint256 tokenId;
         uint256 startPrice;
+        uint256 fixedPrice;
         uint256 startTime;
         uint256 endTime;
         uint256 lastBidPrice;
         address lastBidder;
-        bool isSold;
     }
 
-    mapping(IERC721 => mapping(uint256 => bytes32[])) public orderIdByToken;
+    struct RoyaltyInfo {
+        address receiver;
+        uint256 amount;
+    }
+ 
+    mapping(IERC721 => mapping(uint256 => bytes32)) public orderIdByToken;
     mapping(address => bytes32[]) public orderIdBySeller;
     mapping(bytes32 => Order) public orderInfo;
 
     address public admin;
     address public feeAddress;
     uint16 public feePercent;
+    uint16 public royaltyFeePercent;
 
     event MakeOrder(
-        IERC721 indexed token,
-        uint256 id,
-        bytes32 indexed hash,
+        IERC721 indexed tokenContract,
+        uint256 tokenId,
+        bytes32 indexed orderId,
         address seller
     );
     event CancelOrder(
-        IERC721 indexed token,
-        uint256 id,
-        bytes32 indexed hash,
+        IERC721 indexed tokenContract,
+        uint256 tokenId,
+        bytes32 indexed orderId,
         address seller
     );
     event Bid(
-        IERC721 indexed token,
-        uint256 id,
-        bytes32 indexed hash,
+        IERC721 indexed tokenContract,
+        uint256 tokenId,
+        bytes32 indexed orderId,
         address bidder,
         uint256 bidPrice
     );
     event Claim(
-        IERC721 indexed token,
-        uint256 id,
-        bytes32 indexed hash,
+        IERC721 indexed tokenContract,
+        uint256 tokenId,
+        bytes32 indexed orderId,
         address seller,
         address taker,
         uint256 price
@@ -66,11 +82,12 @@ contract DEX_internal {
         bytes _data
     );
 
-    constructor(uint16 _feePercent) {
+    constructor(uint16 _feePercent, uint16 _royaltyFeePercent) {
         require(_feePercent <= 10000, "input value is more than 100%");
         admin = msg.sender;
         feeAddress = msg.sender;
         feePercent = _feePercent;
+        royaltyFeePercent = _royaltyFeePercent;
     }
 
     function _getCurrentPrice(bytes32 _order)
@@ -78,171 +95,177 @@ contract DEX_internal {
         view
         returns (uint256 price)
     {
-        Order memory o = orderInfo[_order];
-        if (o.orderType == orderType.FIXED) {
-            return o.startPrice;
-        } else if (o.orderType == orderType.AUCTION) {
-            uint256 lastBidPrice = o.lastBidPrice;
-            return lastBidPrice == 0 ? o.startPrice : lastBidPrice;
+        require(_checkOrderStatus(_order) == OrderStatus.ACTIVE, "This order is over or canceled");
+        Order memory order = orderInfo[_order];
+        uint256 lastBidPrice = order.lastBidPrice;
+        if (order.orderType == OrderType.FIXED) {
+            return order.fixedPrice;
+        } else if (order.orderType == OrderType.AUCTION) {
+            return lastBidPrice == 0 ? order.startPrice : lastBidPrice;
+        } else if (order.orderType == OrderType.MIXED) {
+            return lastBidPrice == 0 ? order.startPrice : lastBidPrice;
         }
     }
 
     function _makeOrder(
-        orderType _orderType,
-        IERC721 _token,
-        uint256 _id,
+        OrderType _orderType,
+        IERC721 _tokenContract,
+        uint256 _tokenId,
         uint256 _startPrice,
+        uint256 _fixedPrice,
         uint256 _endTime
-    ) internal returns (bytes32 transactionID) {
+    ) internal returns (bytes32 orderID) {
         require(_endTime > block.timestamp, "Duration must be more than zero");
+        require(_tokenContract.getApproved(_tokenId) == address(this) || 
+                 _tokenContract.isApprovedForAll(_tokenContract.ownerOf(_tokenId), address(this)) == true, 
+                 "DEX Contract must be approved to make transaction with this token ID");
+        require(orderIdByToken[_tokenContract][_tokenId] == 0, "There is already an order for this token ID");
+        orderID = _makeOrderID(_tokenContract, _tokenId, msg.sender);
 
-        bytes32 hash = _hash(_token, _id, msg.sender);
-        orderInfo[hash] = Order(
+        orderInfo[orderID] = Order(
             _orderType,
+            OrderStatus.ACTIVE,
             msg.sender,
-            _token,
-            _id,
+            _tokenContract,
+            _tokenId,
             _startPrice,
+            _fixedPrice,
             block.timestamp,
             _endTime,
             0,
-            address(0),
-            false
+            address(0)
         );
-        orderIdByToken[_token][_id].push(hash);
-        orderIdBySeller[msg.sender].push(hash);
-// dla bida zmienic mechanizm 
-        _token.safeTransferFrom(msg.sender, address(this), _id);
-
-        emit MakeOrder(_token, _id, hash, msg.sender);
-        return hash;
+        
+        orderIdByToken[_tokenContract][_tokenId] = orderID;
+        orderIdBySeller[msg.sender].push(orderID);
+        
+        emit MakeOrder(_tokenContract, _tokenId, orderID, msg.sender);
+        return orderID;
     }
 
-    function _hash(
-        IERC721 _token,
-        uint256 _id,
+    function _makeOrderID(
+        IERC721 _tokenContract,
+        uint256 _tokenId,
         address _seller
     ) internal view returns (bytes32) {
         return
-            keccak256(abi.encodePacked(block.timestamp, _token, _id, _seller));
+            keccak256(abi.encodePacked(block.timestamp, _tokenContract, _tokenId, _seller));
     }
-// poszukac interwal ///
+
+    function _checkOrderStatus(bytes32 _order) internal view returns(OrderStatus) {
+        require(orderInfo[_order].seller != address(0), "This order does not existe");
+        Order memory order = orderInfo[_order];
+        if (order.endTime < block.timestamp) {
+            order.status = OrderStatus.OVER;
+            }
+        return order.status;
+    }
 
     //Bids must be at least 5% higher than the previous bid.
     //If someone bids in the last 5 minutes of an auction, the auction will automatically extend by 5 minutes.
     function _bid(bytes32 _order) internal {
-        Order storage o = orderInfo[_order];
-        uint256 endTime = o.endTime;
-        uint256 lastBidPrice = o.lastBidPrice;
-        address lastBidder = o.lastBidder;
+        Order memory order = orderInfo[_order];
+        uint256 endTime = order.endTime;
+        uint256 lastBidPrice = order.lastBidPrice;
+        address lastBidder = order.lastBidder;
 
-        require(o.orderType == orderType.AUCTION, "only for Auction");
-        require(endTime != 0, "Canceled order");
-        require(endTime >= block.timestamp, "It's over");
-        // powinien sie usuwac
-        require(o.seller != msg.sender, "Can not bid to your order");
-
+        require(_checkOrderStatus(_order) == OrderStatus.ACTIVE, "This order is over or canceled");
+        require(order.orderType != OrderType.FIXED, "Can not bid to this 'fixed price' order");
+        require(order.seller != msg.sender, "Can not bid to your order");
         if (lastBidPrice != 0) {
             require(
                 msg.value >= lastBidPrice + (lastBidPrice / 20),
-                "low price bid"
-            ); //5%
+                "Price is too low (min +5% required)"
+            );
         } else {
             require(
-                msg.value >= o.startPrice && msg.value > 0,
-                "low price bid"
+                msg.value >= order.startPrice && msg.value > 0,
+                "Price can't be less than 'start price'"
             );
         }
 
         if (block.timestamp > endTime - 5 minutes) {
-            o.endTime += 5 minutes;
+            order.endTime += 5 minutes;
         }
-
-        o.lastBidder = msg.sender;
-        o.lastBidPrice = msg.value;
 
         if (lastBidPrice != 0) {
             payable(lastBidder).transfer(lastBidPrice);
         }
 
-        emit Bid(o.token, o.tokenId, _order, msg.sender, msg.value);
+        order.lastBidder = msg.sender;
+        order.lastBidPrice = msg.value;
+
+        emit Bid(order.tokenContract, order.tokenId, _order, msg.sender, msg.value);
     }
 
     function _buyItNow(bytes32 _order) internal {
-        Order storage o = orderInfo[_order];
-        uint256 endTime = o.endTime;
-        require(endTime != 0, "Canceled order");
-        require(endTime > block.timestamp, "It's over");
-        require(o.orderType == orderType.AUCTION, "It's an auction");
-        require(o.isSold == false, "Already sold");
+        Order storage order = orderInfo[_order];
+        require(_checkOrderStatus(_order) == OrderStatus.ACTIVE, "This order is over or canceled");
+        require(order.orderType != OrderType.AUCTION, "It's an auction, you can't 'buy it now'");
 
-        uint256 currentPrice = _getCurrentPrice(_order);
-        require(msg.value >= currentPrice, "price error");
+        require(msg.value == order.fixedPrice, "Wrong price for 'Buy it now!'");
 
-        o.isSold = true;
-
-        uint256 fee = (currentPrice * feePercent) / 10000;
-        payable(o.seller).transfer(currentPrice - fee);
-        payable(feeAddress).transfer(fee);
-        if (msg.value > currentPrice) {
-            payable(msg.sender).transfer(msg.value - currentPrice);
-        }
-
-        o.token.safeTransferFrom(address(this), msg.sender, o.tokenId);
+        order.status = OrderStatus.SOLD;
+        
+        RoyaltyInfo memory royalty = _checkRoyalties(address(order.tokenContract), order.tokenId, order.fixedPrice);
+        
+        uint256 fee = (order.fixedPrice * feePercent) / 10000;
+        uint256 royaltyFee = (royalty.amount * royaltyFeePercent) / 10000;
+        payable(order.seller).transfer(order.fixedPrice - fee - royalty.amount - royaltyFee);
+        payable(feeAddress).transfer(fee + royaltyFee);
+        payable(royalty.receiver).transfer(royalty.amount);
+       
+        order.tokenContract.safeTransferFrom(order.seller, msg.sender, order.tokenId);
 
         emit Claim(
-            o.token,
-            o.tokenId,
+            order.tokenContract,
+            order.tokenId,
             _order,
-            o.seller,
+            order.seller,
             msg.sender,
-            currentPrice
+            order.fixedPrice
         );
     }
 
     function _claim(bytes32 _order) internal {
-        Order storage o = orderInfo[_order];
-        address seller = o.seller;
-        address lastBidder = o.lastBidder;
-        require(o.isSold == false, "Already sold");
+        Order storage order = orderInfo[_order];
+        require(_checkOrderStatus(_order) == OrderStatus.OVER, "This order is not finish yet");
+        require(order.orderType != OrderType.FIXED, "This order is not an auction");
+        
+        address seller = order.seller;
+        address lastBidder = order.lastBidder;
+        require(seller == msg.sender || lastBidder == msg.sender, "Access denied");
+        
 
-        require(
-            seller == msg.sender || lastBidder == msg.sender,
-            "Access denied"
-        );
-        require(
-            o.orderType == orderType.AUCTION,
-            "This function is an Auction"
-        );
-        require(block.number > o.endTime, "Not yet");
+        order.status = OrderStatus.SOLD;
 
-        IERC721 token = o.token;
-        uint256 tokenId = o.tokenId;
-        uint256 lastBidPrice = o.lastBidPrice;
-
+        IERC721 token = order.tokenContract;
+        uint256 tokenId = order.tokenId;
+        uint256 lastBidPrice = order.lastBidPrice;
         uint256 fee = (lastBidPrice * feePercent) / 10000;
+        RoyaltyInfo memory royalty = _checkRoyalties(address(token), tokenId, lastBidPrice);
+        uint256 royaltyFee = (royalty.amount * royaltyFeePercent) / 10000;
 
-        o.isSold = true;
+        payable(seller).transfer(lastBidPrice - fee - royalty.amount - royaltyFee);
+        payable(feeAddress).transfer(fee + royaltyFee);
+        payable(royalty.receiver).transfer(royalty.amount);
 
-        payable(seller).transfer(lastBidPrice - fee);
-        payable(feeAddress).transfer(fee);
-        token.safeTransferFrom(address(this), lastBidder, tokenId);
+        token.safeTransferFrom(order.seller, lastBidder, tokenId);
 
         emit Claim(token, tokenId, _order, seller, lastBidder, lastBidPrice);
     }
 
-    function _cancelOrder(bytes32 _order) internal {
-        Order storage o = orderInfo[_order];
-        require(o.seller == msg.sender, "Access denied");
-        require(o.lastBidPrice == 0, "Bidding exist");
-        require(o.isSold == false, "Already sold");
+  function _cancelOrder(bytes32 _order) internal {
+        Order storage order = orderInfo[_order];
+        require(_checkOrderStatus(_order) == OrderStatus.ACTIVE, "This order is not active");
+        require(order.seller == msg.sender, "Access denied");
+        require(order.lastBidPrice == 0, "Bidding exist");
+        
+        IERC721 token = order.tokenContract;
+        uint256 tokenId = order.tokenId;
 
-        IERC721 token = o.token;
-        uint256 tokenId = o.tokenId;
+        order.status = OrderStatus.CANCELED;
 
-        o.endTime = 0; //0 means the order was canceled.
-
-        token.safeTransferFrom(address(this), msg.sender, tokenId);
         emit CancelOrder(token, tokenId, _order, msg.sender);
     }
 
@@ -264,23 +287,16 @@ contract DEX_internal {
         feePercent = _percent;
     }
 
-    event Received(address, uint256);
+    function _checkRoyalties(address tokenContract, uint256 tokenId, uint256 transactionAmount) internal view returns(RoyaltyInfo memory royalty){
+        (address receiver, uint256 amount) = IERC2981(tokenContract).royaltyInfo(tokenId, transactionAmount);
+        royalty.receiver = receiver;
+        royalty.amount = amount;
+        return royalty;
+    }
+
+    event Received(address sender, uint256 value);
 
     receive() external payable {
         emit Received(msg.sender, msg.value);
-    }
-
-//TODO 
-    function onERC721Received(
-        address _operator,
-        address _from,
-        uint256 _tokenId,
-        bytes calldata _data
-    ) external returns (bytes4) {
-        emit TestEvent(_operator, _from, _tokenId, _data);
-        return
-            bytes4(
-                keccak256("onERC721Received(address,address,uint256,bytes)")
-            );
     }
 }

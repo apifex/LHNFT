@@ -4,7 +4,7 @@ pragma solidity ^0.8.0;
 import "../interfaces/IERC721.sol";
 import "../interfaces/IERC721Receiver.sol";
 
-abstract contract NFT_internal is IERC721 {
+abstract contract NFT_internal is IERC721{
     
     address payable internal _admin;
 
@@ -16,26 +16,30 @@ abstract contract NFT_internal is IERC721 {
 
     mapping(address => mapping(address => bool)) internal _operatorApprovals;
 
-    mapping(uint256 => string) internal _tokenURI;
+    struct TokenUri {
+        string uri;
+        bool useBase;
+    }
+
+    mapping(uint256 => TokenUri) internal _tokenURI;
+
+    mapping(IERC721 => mapping(uint=> bool)) internal requiredMintTokens; 
 
     string internal _baseURI;
+
+    uint256 internal actualTokenId;
+
+    uint256 internal _mintPrice;
+
+    uint256 internal _defaultRoyalty;
+
+    
 
     modifier onlyAdmin() {
         require(msg.sender == _admin, "only admin can do this");
         _;
     }
 
-    function _approve(address _approved, uint256 _tokenId) internal {
-        address owner = _owners[_tokenId];
-        require(owner != _approved, "approval to current owner");
-        require(
-            // podzielic na dwa
-            msg.sender == owner || this.isApprovedForAll(owner, _approved),
-            "approve caller is not owner or appoved for all"
-        );
-        _tokenApprovals[_tokenId] = _approved;
-        emit Approval(owner, _approved, _tokenId);
-    }
 
     function _setApprovalForAll(address _operator, bool _approved) internal {
         address owner = msg.sender;
@@ -81,8 +85,8 @@ abstract contract NFT_internal is IERC721 {
                     tokenId,
                     _data
                 )
-            returns (bytes4 retval) {
-                return retval == IERC721Receiver.onERC721Received.selector;
+            returns (bytes4 response) {
+                return response == IERC721Receiver.onERC721Received.selector;
             } catch (bytes memory reason) {
                 if (reason.length == 0) {
                     revert(
@@ -99,22 +103,23 @@ abstract contract NFT_internal is IERC721 {
         }
     }
 
-    function _mint(address to, uint256 tokenId) internal {
-        require(to != address(0), "mint to zero address");
-        require(_owners[tokenId] == address(0), "token already minted");
+    function _checkIfExists(uint256 tokenId) internal view returns(bool) {
+        return _owners[tokenId] != address(0);
+    }
 
-        _balances[to] += 1;
-        _owners[tokenId] = to;
-
-        emit Transfer(address(0), to, tokenId);
+    function _createTokenId() internal returns (uint256 tokenId) {
+        while (_checkIfExists(actualTokenId)) {
+            actualTokenId++;    
+        }
+        return actualTokenId;
     }
 
     function _getBaseURI() internal view returns (string memory) {
         return _baseURI;
     }
 
-    function _setTokenURI(uint256 tokenId, string memory uri) internal {
-        _tokenURI[tokenId] = uri;
+    function _setTokenURI(uint256 tokenId, string memory uri, bool useBase) internal {
+        _tokenURI[tokenId] = TokenUri(uri, useBase);
     }
 
     function _getTokenURI(uint256 tokenId)
@@ -122,13 +127,22 @@ abstract contract NFT_internal is IERC721 {
         view
         returns (string memory)
     {
-        return string(abi.encodePacked(_getBaseURI(), _tokenURI[tokenId]));
+        TokenUri memory tokenUri = _tokenURI[tokenId];
+        if (tokenUri.useBase) {
+            return string(abi.encodePacked(_getBaseURI(), tokenUri.uri));
+        } else {
+            return tokenUri.uri;
+        }
+        
     }
 
     function _burn(uint256 tokenId) internal {
         address owner = this.ownerOf(tokenId);
+        require(msg.sender == owner, "Only owner can burn token");
         this.approve(address(0), tokenId);
         _balances[owner] -= 1;
         delete _owners[tokenId];
+
+        emit Transfer(owner, address(0), tokenId);
     }
 }
